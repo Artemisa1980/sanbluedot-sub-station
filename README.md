@@ -1,6 +1,4 @@
-# sanblueᵈᵒᵗ sub-station
-
-*retro dev-station — by Sandy E. Quintero*
+# SANDY.SYSDEV v2.3.1 — retro sub-station
 
 **sub-station 2.3.1** is a fully local subtitle studio for Apple Silicon Macs.
 It generates a timed SubRip file from a movie's own audio, can translate English
@@ -148,8 +146,10 @@ ID signing and notarization.
   localization pass. Incorrect English recognition cannot be repaired reliably by translation.
 - No batch processing yet.
 
+## License
+
+[MIT](LICENSE) — the code is free to use. The **sanblueᵈᵒᵗ** name, wordmark and brand
+identity are not covered by the license.
+
 ---
-
-**sanblueᵈᵒᵗ** — retro dev-station · © 2026 Sandy E. Quintero
-
-Released under the MIT License — see [LICENSE](LICENSE).
+© 2026 Sandy E. Quintero — sanblueᵈᵒᵗ · retro dev-station
