@@ -1,0 +1,48 @@
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# PyInstaller build products and packaged app
+build/
+dist/
+*.app
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and local configuration
+.env
+.env.*
+*.local
+*.pem
+*.key
+
+# Local notes, handoff and model context files
+relay-log.md
+CLAUDE.md
+AGENTS.md
+*.local.md
+notes/
+
+# Logs, coverage and temporary files
+*.log
+*.tmp
+.coverage
+htmlcov/
+
+# Personal media and generated subtitles (never publish source material)
+*.mp4
+*.mkv
+*.m4v
+*.mov
+*.avi
+*.srt
