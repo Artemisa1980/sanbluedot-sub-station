@@ -10,6 +10,7 @@ re-encoding video or audio.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import queue
@@ -61,6 +62,14 @@ AD_PATTERNS = [
 # URL patterns can remove a genuine spoken website line. The accepted safeguard
 # is that clean_ads always writes a separate copy and leaves the source untouched.
 _AD_RE = re.compile("|".join(AD_PATTERNS), re.IGNORECASE)
+
+# Temporary files are created owner-only (0600). Published subtitles get the
+# usual umask-based mode instead, so media servers running as another user can
+# read them. os.umask can only be read by setting it, so read it once at import,
+# before the GUI starts any worker thread.
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+NEW_FILE_MODE = 0o666 & ~_UMASK
 _TIMESTAMP_RE = re.compile(
     r"^\s*(?P<start>\d{2,}:\d{2}:\d{2},\d{3})\s+-->\s+"
     r"(?P<end>\d{2,}:\d{2}:\d{2},\d{3})(?:\s+.*)?$"
@@ -262,25 +271,31 @@ def run(
     reader_done = False
     cancelled = False
 
-    while process.poll() is None or not reader_done or not lines.empty():
-        if cancel_event is not None and cancel_event.is_set() and process.poll() is None:
-            cancelled = True
-            _terminate_process_group(process)
-        try:
-            line = lines.get(timeout=0.1)
-        except queue.Empty:
-            continue
-        if line is None:
-            reader_done = True
-            continue
-        clean_line = line.rstrip()
-        if clean_line:
-            tail.append(clean_line)
-        print(line, end="")
-        if on_log is not None:
-            on_log(line)
+    try:
+        while process.poll() is None or not reader_done or not lines.empty():
+            if cancel_event is not None and cancel_event.is_set() and process.poll() is None:
+                cancelled = True
+                _terminate_process_group(process)
+            try:
+                line = lines.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is None:
+                reader_done = True
+                continue
+            clean_line = line.rstrip()
+            if clean_line:
+                tail.append(clean_line)
+            print(line, end="")
+            if on_log is not None:
+                on_log(line)
 
-    return_code = process.wait()
+        return_code = process.wait()
+    except BaseException:
+        # The tool runs in its own session, so a terminal Ctrl-C never reaches
+        # it. Stop it here before KeyboardInterrupt (or any error) propagates.
+        _terminate_process_group(process)
+        raise
     reader.join(timeout=1)
     if process.stdout is not None:
         process.stdout.close()
@@ -361,6 +376,13 @@ def _read_srt(path: Path) -> str:
         raise EngineError(f"could not read {path.name}: {error}")
 
 
+def _apply_new_file_mode(path: Path) -> None:
+    # FAT and exFAT volumes store no permission bits and may reject chmod; the
+    # file is still usable there, so this is best effort.
+    with contextlib.suppress(OSError):
+        os.chmod(path, NEW_FILE_MODE)
+
+
 def _atomic_write(path: Path, text: str) -> None:
     temp_path: Path | None = None
     try:
@@ -375,6 +397,7 @@ def _atomic_write(path: Path, text: str) -> None:
         ) as handle:
             handle.write(text)
             temp_path = Path(handle.name)
+        _apply_new_file_mode(temp_path)
         temp_path.replace(path)
     except OSError as error:
         raise EngineError(f"could not write {path.name}: {error}")
@@ -383,14 +406,42 @@ def _atomic_write(path: Path, text: str) -> None:
             temp_path.unlink()
 
 
+def _publish_by_reserved_name(staged: Path, destination: Path) -> None:
+    """Publish where hard links are unsupported, still never replacing a file.
+
+    The destination name is reserved with an exclusive create, then the complete
+    file is renamed over that empty placeholder. Readers can briefly see an empty
+    file, but never a partial one, and an existing file is never touched.
+    """
+    try:
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise EngineError(
+            f"output already exists, not overwriting: {destination.name}"
+        ) from None
+    except OSError as error:
+        raise EngineError(f"could not publish {destination.name}: {error}") from error
+    os.close(descriptor)
+    try:
+        os.replace(staged, destination)
+    except OSError as error:
+        # Remove only the empty placeholder created above.
+        with contextlib.suppress(OSError):
+            destination.unlink()
+        raise EngineError(f"could not publish {destination.name}: {error}") from error
+
+
 def _publish_new_file(staged: Path, destination: Path) -> None:
     """Publish a complete file atomically without ever replacing a destination."""
     try:
         os.link(staged, destination)
     except FileExistsError:
         raise EngineError(f"output already exists, not overwriting: {destination.name}")
-    except OSError as error:
-        raise EngineError(f"could not publish {destination.name}: {error}")
+    except OSError:
+        # exFAT, FAT32 and many network shares have no hard links (EPERM or
+        # ENOTSUP). Failing here would let the caller's cleanup delete a finished file.
+        _publish_by_reserved_name(staged, destination)
+        return
     try:
         staged.unlink()
     except OSError:
@@ -414,6 +465,7 @@ def _write_new_file(path: Path, text: str) -> None:
         ) as handle:
             handle.write(text)
             temp_path = Path(handle.name)
+        _apply_new_file_mode(temp_path)
         _publish_new_file(temp_path, path)
     except OSError as error:
         raise EngineError(f"could not write {path.name}: {error}")
@@ -666,10 +718,10 @@ def embed(
                 resolve_binary("ffmpeg"),
                 "-i", str(movie),
                 "-i", str(srt),
-                # Map primary video and all audio, not every source stream. Mapping
-                # existing PGS/VOBSUB tracks would make mov_text conversion fail.
+                # Map primary video and all audio (if any), not every source stream.
+                # Mapping existing PGS/VOBSUB tracks would make mov_text conversion fail.
                 "-map", "0:v:0",
-                "-map", "0:a",
+                "-map", "0:a?",
                 "-map", "1",
                 "-c", "copy",
                 "-c:s", "mov_text",
@@ -759,6 +811,10 @@ def main() -> None:
             print(f"Done: {subbed}")
     except EngineError as error:
         sys.exit(f"ERROR: {error}")
+    except KeyboardInterrupt:
+        print("\nCancelled. Completed files were kept; partial outputs were removed.",
+              file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":

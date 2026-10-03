@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import errno
+import os
 import queue
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -11,8 +14,15 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import substation
-import substation_gui
 import translation_worker
+
+try:
+    import substation_gui
+except ModuleNotFoundError as error:
+    # Engine tests must still run on a Python built without Tk.
+    if error.name not in {"tkinter", "_tkinter"}:
+        raise
+    substation_gui = None
 
 
 class TemporaryDirectoryTest(unittest.TestCase):
@@ -238,6 +248,7 @@ class PipelineSafetyTests(TemporaryDirectoryTest):
 
         self.assertEqual(output.read_bytes(), b"mp4")
         self.assertIn("language=spa", captured)
+        self.assertEqual(captured[captured.index("0:v:0") + 2], "0:a?")
 
     def test_translation_preserves_timestamps_and_writes_separate_srt(self) -> None:
         self.srt.write_text(
@@ -353,6 +364,50 @@ class PipelineSafetyTests(TemporaryDirectoryTest):
             with self.assertRaisesRegex(substation.EngineError, "parakeet-mlx>=0.4.1"):
                 substation.check_parakeet_dependencies()
 
+    def test_publish_without_hard_links_uses_reserved_name(self) -> None:
+        staged = self.temp_dir / "staged.srt"
+        destination = self.temp_dir / "final.srt"
+        staged.write_text("complete", encoding="utf-8")
+        no_links = PermissionError(errno.EPERM, "Operation not permitted")  # FAT/exFAT
+        with patch.object(substation.os, "link", side_effect=no_links):
+            substation._publish_new_file(staged, destination)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "complete")
+        self.assertFalse(staged.exists())
+
+    def test_publish_without_hard_links_never_overwrites(self) -> None:
+        staged = self.temp_dir / "staged.srt"
+        destination = self.temp_dir / "final.srt"
+        staged.write_text("new", encoding="utf-8")
+        destination.write_text("existing", encoding="utf-8")
+        with patch.object(substation.os, "link", side_effect=OSError(errno.ENOTSUP, "no links")):
+            with self.assertRaisesRegex(substation.EngineError, "not overwriting"):
+                substation._publish_new_file(staged, destination)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "existing")
+        self.assertEqual(staged.read_text(encoding="utf-8"), "new")
+
+    def test_transcription_survives_a_volume_without_hard_links(self) -> None:
+        def fake_run(command, _step=None, **_kwargs) -> None:
+            output_dir = Path(command[command.index("--output-dir") + 1])
+            (output_dir / "movie.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello\n",
+                encoding="utf-8",
+            )
+
+        with patch.object(substation, "resolve_binary", return_value="mlx_whisper"), patch.object(
+            substation, "run", side_effect=fake_run
+        ), patch.object(substation.os, "link", side_effect=PermissionError(errno.EPERM, "no")):
+            result = substation.transcribe(self.movie)
+
+        self.assertEqual(result.read_text(encoding="utf-8").splitlines()[-1], "Hello")
+        self.assertFalse(any(path.name.startswith(".sub-station-") for path in self.temp_dir.iterdir()))
+
+    def test_published_subtitles_use_umask_mode_not_owner_only(self) -> None:
+        self.srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+        substation.clean_srt(self.srt)
+        cleaned, *_counts = substation.clean_ads(self.srt)
+        for path in (self.srt, cleaned):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), substation.NEW_FILE_MODE)
+
     def test_dedicated_whisper_binary_wins_over_inherited_path(self) -> None:
         dedicated = self.temp_dir / "mlx_whisper"
         dedicated.write_text("executable", encoding="utf-8")
@@ -441,6 +496,7 @@ class TranslationWorkerTests(unittest.TestCase):
         self.assertEqual(translator.call_args_list[1].kwargs["device"], "cpu")
 
 
+@unittest.skipIf(substation_gui is None, "Tk is not available in this Python")
 class GuiWorkflowTests(TemporaryDirectoryTest):
     def test_cancel_after_translation_recovers_spanish_output(self) -> None:
         movie = self.temp_dir / "movie.mp4"
@@ -576,6 +632,7 @@ class GuiWorkflowTests(TemporaryDirectoryTest):
         fake_app = types.SimpleNamespace(
             srt_var=types.SimpleNamespace(get=lambda: str(source)),
             _last_output=None,
+            _last_clean_output=None,
             clean_reveal_button=fake_widget,
             new_job_button=fake_widget,
             clean_status=types.SimpleNamespace(configure=lambda **kwargs: status.update(kwargs)),
@@ -586,10 +643,34 @@ class GuiWorkflowTests(TemporaryDirectoryTest):
         ), patch.object(substation_gui.messagebox, "showinfo") as info:
             substation_gui.SubStation._clean_srt(fake_app)
 
+        self.assertEqual(fake_app._last_clean_output, output)
+        self.assertIsNone(fake_app._last_output)
         self.assertIn("0 promo lines", status["text"])
         self.assertIn("1 invalid/empty cues", status["text"])
         self.assertIn("0 promotional lines", info.call_args.args[1])
         self.assertIn("1 invalid or empty cues", info.call_args.args[1])
+
+
+    def test_event_polling_stops_after_window_closes(self) -> None:
+        events: queue.Queue = queue.Queue()
+        events.put(("done", {"state": "cancelled", "message": "x", "output": None}))
+        events.put(("log", "late output"))
+
+        def finish_and_close(_payload) -> None:
+            fake_app._destroyed = True
+
+        def destroyed(*_args):
+            raise AssertionError("Tk used after the window was destroyed")
+
+        fake_app = types.SimpleNamespace(
+            _events=events,
+            _destroyed=False,
+            _finish_job=finish_and_close,
+            _append_log=destroyed,
+            winfo_exists=destroyed,
+            after=destroyed,
+        )
+        substation_gui.SubStation._poll_events(fake_app)
 
 
 class ProcessRunnerTests(unittest.TestCase):
@@ -599,6 +680,23 @@ class ProcessRunnerTests(unittest.TestCase):
                 [sys.executable, "-c", "print('specific failure'); raise SystemExit(3)"],
                 "Test tool",
             )
+
+    def test_interrupt_stops_tool_before_propagating(self) -> None:
+        pids: list[int] = []
+
+        def interrupt_on_first_line(line: str) -> None:
+            pids.append(int(line))
+            raise KeyboardInterrupt  # what Ctrl-C raises in the CLI
+
+        with self.assertRaises(KeyboardInterrupt):
+            substation.run(
+                [sys.executable, "-c",
+                 "import os, time; print(os.getpid(), flush=True); time.sleep(30)"],
+                "Interrupted tool",
+                on_log=interrupt_on_first_line,
+            )
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pids[0], 0)
 
     def test_cancel_stops_process_group(self) -> None:
         cancel = threading.Event()

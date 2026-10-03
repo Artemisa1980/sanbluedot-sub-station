@@ -71,7 +71,11 @@ class SubStation(tk.Tk):
         self._busy = False
         self._cancel_event: threading.Event | None = None
         self._close_when_done = False
+        self._destroyed = False
+        # Each tab reveals its own result, so a clean never redirects the
+        # Generate tab's Reveal in Finder button (or the other way round).
         self._last_output: Path | None = None
+        self._last_clean_output: Path | None = None
         self._tools_ready = False
         self._translator_ready = False
         self._parakeet_ready = False
@@ -241,7 +245,8 @@ class SubStation(tk.Tk):
         )
         self.new_job_button.grid(row=0, column=1, padx=(8, 0))
         self.reveal_button = ttk.Button(
-            status_row, text="Reveal in Finder", command=self._reveal_output,
+            status_row, text="Reveal in Finder",
+            command=lambda: self._reveal(self._last_output),
             state="disabled",
         )
         self.reveal_button.grid(row=0, column=2, padx=(8, 0))
@@ -311,7 +316,8 @@ class SubStation(tk.Tk):
         )
         self.clean_button.pack(side="left")
         self.clean_reveal_button = ttk.Button(
-            clean_actions, text="Reveal in Finder", command=self._reveal_output,
+            clean_actions, text="Reveal in Finder",
+            command=lambda: self._reveal(self._last_clean_output),
             state="disabled",
         )
         self.clean_reveal_button.pack(side="left", padx=(10, 0))
@@ -605,7 +611,7 @@ class SubStation(tk.Tk):
             return
         try:
             output, kept, removed_lines, dropped_cues = clean_ads(srt)
-            self._last_output = output
+            self._last_clean_output = output
             self.clean_reveal_button.configure(state="normal")
             self.new_job_button.configure(state="normal")
             self.clean_status.configure(
@@ -647,6 +653,7 @@ class SubStation(tk.Tk):
         self.existing_language_var.set("Spanish")
         self.embed_var.set(False)
         self._last_output = None
+        self._last_clean_output = None
         self._close_when_done = False
         self.progress.stop()
         self.progress.configure(value=0)
@@ -709,6 +716,9 @@ class SubStation(tk.Tk):
                     self._append_log(str(payload))
                 elif event == "done":
                     self._finish_job(payload)
+                    if self._destroyed:
+                        # The window closed when the job ended; Tk is gone.
+                        return
         except queue.Empty:
             pass
         if self.winfo_exists():
@@ -742,6 +752,7 @@ class SubStation(tk.Tk):
         self._append_log(f"\n{labels[state]}\n{message}\n")
 
         if self._close_when_done:
+            self._destroyed = True
             self.destroy()
             return
         if state == "success":
@@ -765,9 +776,9 @@ class SubStation(tk.Tk):
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _reveal_output(self) -> None:
-        if self._last_output is not None and self._last_output.exists():
-            subprocess.run(["open", "-R", str(self._last_output)], check=False)
+    def _reveal(self, output: Path | None) -> None:
+        if output is not None and output.exists():
+            subprocess.run(["open", "-R", str(output)], check=False)
 
     def _on_close(self) -> None:
         if not self._busy:

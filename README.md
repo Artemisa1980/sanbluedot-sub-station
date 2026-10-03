@@ -51,6 +51,12 @@ movie → mlx_whisper or parakeet-mlx → validated SRT → optional local Spani
   been downloaded once. Movie audio and subtitle text are not sent to an API.
 - Generated and cleaned files use same-folder temporary outputs and exclusive atomic
   publication. A file that appears at the destination during a job is never overwritten.
+  On drives without hard links, such as exFAT or FAT32, the name is reserved exclusively
+  first and the finished file is renamed over that empty placeholder.
+- Published subtitles follow the normal file permissions (umask), so a media server
+  running as another user can read them.
+- Ctrl-C in the command line stops the running tool too, keeps completed files and
+  removes partial ones.
 - The source movie and downloaded SRT are never overwritten.
 - Failed or cancelled jobs remove partial outputs, including a cancellation received just
   before final publication.
