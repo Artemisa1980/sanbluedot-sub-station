@@ -20,10 +20,12 @@ if sys.stdout is None or sys.stderr is None:
     sys.stderr = sys.stderr or _devnull
 
 from substation import (
+    ENGINES,
     VERSION,
     CancelledError,
     EngineError,
     check_dependencies,
+    check_parakeet_dependencies,
     check_translation_dependencies,
     clean_ads,
     clean_srt,
@@ -50,14 +52,18 @@ SUBTITLE_MODES = {
     "Spanish audio → Spanish SRT": ("es", "es"),
 }
 EXISTING_SRT_LANGUAGES = {"Spanish": "es", "English": "en"}
+SPEECH_ENGINES = {
+    "Whisper large-v3-turbo": "whisper",
+    "Parakeet TDT 0.6B v3": "parakeet",
+}
+DEFAULT_ENGINE = "Whisper large-v3-turbo"
 
 
 class SubStation(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"sub-station {VERSION} — sanbluedot")
-        self.geometry("760x610")
-        self.minsize(700, 560)
+        self.minsize(700, 610)
         self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -68,11 +74,14 @@ class SubStation(tk.Tk):
         self._last_output: Path | None = None
         self._tools_ready = False
         self._translator_ready = False
+        self._parakeet_ready = False
+        self._parakeet_detail = ""
 
         self._configure_styles()
         self._build_header()
         self._build_body()
         self._bind_shortcuts()
+        self._fit_to_content()
         self.after(80, self._poll_events)
         threading.Thread(target=self._dependency_worker, daemon=True).start()
 
@@ -163,19 +172,33 @@ class SubStation(tk.Tk):
             width=32,
         )
         self.language_box.grid(row=0, column=1, sticky="w")
+        ttk.Label(options, text="Speech engine:").grid(
+            row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0)
+        )
+        self.engine_var = tk.StringVar(value=DEFAULT_ENGINE)
+        self.engine_box = ttk.Combobox(
+            options,
+            textvariable=self.engine_var,
+            values=list(SPEECH_ENGINES),
+            state="readonly",
+            width=32,
+        )
+        self.engine_box.grid(row=1, column=1, sticky="w", pady=(10, 0))
         self.embed_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             options,
             text="Also create a new MP4 with the subtitle track (no re-encoding)",
             variable=self.embed_var,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Label(
             options,
-            text="English → Spanish is machine-translated locally after transcription; timing is preserved.",
+            text="English → Spanish is machine-translated locally after transcription; timing is preserved.\n"
+                 "Parakeet detects the spoken language itself; the mode still sets the subtitle language.",
             style="Muted.TLabel",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(options, text="Existing SRT language:").grid(
-            row=3, column=0, sticky="w", padx=(0, 10), pady=(10, 0)
+            row=4, column=0, sticky="w", padx=(0, 10), pady=(10, 0)
         )
         self.existing_language_var = tk.StringVar(value="Spanish")
         self.existing_language_box = ttk.Combobox(
@@ -185,7 +208,7 @@ class SubStation(tk.Tk):
             state="readonly",
             width=14,
         )
-        self.existing_language_box.grid(row=3, column=1, sticky="w", pady=(10, 0))
+        self.existing_language_box.grid(row=4, column=1, sticky="w", pady=(10, 0))
 
         actions = ttk.Frame(tab)
         actions.grid(row=4, column=0, sticky="ew", pady=(16, 10))
@@ -297,6 +320,13 @@ class SubStation(tk.Tk):
         self.clean_status.grid(row=5, column=0, sticky="w", pady=(20, 0))
         return tab
 
+    def _fit_to_content(self) -> None:
+        """Open tall enough for the Activity log with this platform's fonts."""
+        self.update_idletasks()
+        # Leave room for the menu bar and Dock instead of opening off-screen.
+        height = min(self.winfo_reqheight(), self.winfo_screenheight() - 120)
+        self.geometry(f"760x{max(height, 610)}")
+
     def _bind_shortcuts(self) -> None:
         self.bind("<Command-o>", lambda _event: self._pick_movie())
         self.bind("<Command-Return>", lambda _event: self._start_generate())
@@ -323,15 +353,26 @@ class SubStation(tk.Tk):
                 translation_status: tuple[bool, object] = (True, translator)
             except EngineError as error:
                 translation_status = (False, str(error))
-            self._events.put(("dependencies", (True, tools, translation_status)))
+            try:
+                parakeet_status: tuple[bool, str] = (True, check_parakeet_dependencies())
+            except EngineError as error:
+                parakeet_status = (False, str(error))
+            self._events.put(
+                ("dependencies", (True, tools, translation_status, parakeet_status))
+            )
         except EngineError as error:
-            self._events.put(("dependencies", (False, str(error), (False, "Core tools missing"))))
+            self._events.put(("dependencies", (
+                False, str(error), (False, "Core tools missing"), (False, "Core tools missing"),
+            )))
 
     # ------------------------------------------------------------------
     # Jobs
     # ------------------------------------------------------------------
     def _selected_mode(self) -> tuple[str, str]:
         return SUBTITLE_MODES[self.language_var.get()]
+
+    def _selected_engine(self) -> str:
+        return SPEECH_ENGINES[self.engine_var.get()]
 
     def _valid_movie(self) -> Path | None:
         raw = self.movie_var.get().strip()
@@ -374,6 +415,7 @@ class SubStation(tk.Tk):
     def _start_generate(self) -> None:
         movie = self._valid_movie()
         source_language, subtitle_language = self._selected_mode()
+        engine = self._selected_engine()
         if subtitle_language != source_language and not self._translator_ready:
             messagebox.showerror(
                 "Spanish translation unavailable",
@@ -381,12 +423,21 @@ class SubStation(tk.Tk):
                 "English and Spanish transcription modes are still available.",
             )
             return
+        if engine == "parakeet" and self._tools_ready and not self._parakeet_ready:
+            messagebox.showerror(
+                "Parakeet unavailable",
+                f"{self._parakeet_detail}\n\nWhisper is still available.",
+            )
+            return
         if movie is None or not self._begin_job("Preparing transcription…"):
             return
         do_embed = self.embed_var.get()
         threading.Thread(
             target=self._generate_worker,
-            args=(movie, source_language, subtitle_language, do_embed, self._cancel_event),
+            args=(
+                movie, source_language, subtitle_language, do_embed,
+                self._cancel_event, engine,
+            ),
             daemon=True,
         ).start()
 
@@ -397,14 +448,16 @@ class SubStation(tk.Tk):
         subtitle_language: str,
         do_embed: bool,
         cancel_event: threading.Event,
+        engine: str = "whisper",
     ) -> None:
         srt: Path | None = None
         output: Path | None = None
         try:
-            self._events.put(("stage", "Transcribing audio…"))
+            self._events.put(("stage", f"Transcribing audio with {ENGINES[engine]}…"))
             srt = transcribe(
                 movie,
                 source_language,
+                engine,
                 on_log=self._queue_log,
                 cancel_event=cancel_event,
             )
@@ -423,7 +476,7 @@ class SubStation(tk.Tk):
                 review = ", ".join(repetitions[:4])
                 suffix = "…" if len(repetitions) > 4 else ""
                 warning = (
-                    "Review repeated phrases (they may be dialogue, lyrics, or Whisper artifacts): "
+                    "Review repeated phrases (they may be dialogue, lyrics, or transcription artifacts): "
                     f"{review}{suffix}"
                 )
                 message += f"\n{warning}"
@@ -590,6 +643,7 @@ class SubStation(tk.Tk):
         self.movie_var.set("")
         self.srt_var.set("")
         self.language_var.set("English audio → English SRT")
+        self.engine_var.set(DEFAULT_ENGINE)
         self.existing_language_var.set("Spanish")
         self.embed_var.set(False)
         self._last_output = None
@@ -615,13 +669,20 @@ class SubStation(tk.Tk):
             while True:
                 event, payload = self._events.get_nowait()
                 if event == "dependencies":
-                    ready, detail, translation_status = payload
+                    ready, detail, translation_status, parakeet_status = payload
                     self._tools_ready = bool(ready)
                     if ready:
                         translation_ready, translation_detail = translation_status
+                        parakeet_ready, parakeet_detail = parakeet_status
                         self._translator_ready = bool(translation_ready)
-                        label = "● Core + Spanish ready" if translation_ready else "● Core ready"
-                        self.tools_label.configure(text=label, fg=DOT)
+                        self._parakeet_ready = bool(parakeet_ready)
+                        self._parakeet_detail = str(parakeet_detail)
+                        label = "● Core"
+                        if translation_ready:
+                            label += " + Spanish"
+                        if parakeet_ready:
+                            label += " + Parakeet"
+                        self.tools_label.configure(text=f"{label} ready", fg=DOT)
                         tools = detail
                         self._append_log(
                             f"mlx_whisper: {tools['mlx_whisper']}\nffmpeg: {tools['ffmpeg']}\n"
@@ -634,6 +695,10 @@ class SubStation(tk.Tk):
                             self._append_log(
                                 f"Spanish translator not ready:\n{translation_detail}\n"
                             )
+                        if parakeet_ready:
+                            self._append_log(f"Parakeet: {parakeet_detail}\n")
+                        else:
+                            self._append_log(f"Parakeet not ready:\n{parakeet_detail}\n")
                     else:
                         self.tools_label.configure(text="● Tools missing", fg="#FF8A80")
                         self._append_log(f"Dependency check failed:\n{detail}\n")

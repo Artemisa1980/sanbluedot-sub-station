@@ -8,7 +8,7 @@ import threading
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import substation
 import substation_gui
@@ -303,6 +303,56 @@ class PipelineSafetyTests(TemporaryDirectoryTest):
         self.assertEqual(destination.read_text(encoding="utf-8"), "existing")
         self.assertEqual(staged.read_text(encoding="utf-8"), "new")
 
+    def test_parakeet_uses_explicit_srt_output_and_cue_limits(self) -> None:
+        captured: list[str] = []
+
+        def fake_run(command, _step=None, **_kwargs) -> None:
+            captured.extend(command)
+            # parakeet-mlx names its output after the input stem ("{filename}").
+            output_dir = Path(command[command.index("--output-dir") + 1])
+            (output_dir / f"{self.movie.stem}.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHola\n",
+                encoding="utf-8",
+            )
+
+        with patch.object(
+            substation, "resolve_binary", return_value="parakeet-mlx"
+        ) as resolver, patch.object(substation, "run", side_effect=fake_run):
+            result = substation.transcribe(self.movie, "es", "parakeet")
+
+        resolver.assert_called_once_with("parakeet-mlx")
+        self.assertEqual(result, self.srt)
+        self.assertEqual(captured[captured.index("--model") + 1], substation.PARAKEET_MODEL)
+        self.assertEqual(captured[captured.index("--output-format") + 1], "srt")
+        self.assertEqual(captured[captured.index("--output-template") + 1], "{filename}")
+        self.assertEqual(captured[captured.index("--max-words") + 1], "14")
+        self.assertNotIn("--language", captured)
+        self.assertNotIn("--condition-on-previous-text", captured)
+        self.assertFalse(any(path.name.startswith(".sub-station-") for path in self.temp_dir.iterdir()))
+
+    def test_parakeet_success_exit_without_output_is_a_failure(self) -> None:
+        # parakeet-mlx prints a per-file error and still exits 0.
+        with patch.object(substation, "resolve_binary", return_value="parakeet-mlx"), patch.object(
+            substation, "run", return_value=None
+        ):
+            with self.assertRaisesRegex(substation.EngineError, "was not created"):
+                substation.transcribe(self.movie, engine="parakeet")
+
+        self.assertFalse(self.srt.exists())
+        self.assertFalse(any(path.name.startswith(".sub-station-") for path in self.temp_dir.iterdir()))
+
+    def test_unknown_engine_is_rejected_before_any_output(self) -> None:
+        with self.assertRaisesRegex(substation.EngineError, "unsupported speech engine"):
+            substation.transcribe(self.movie, engine="vosk")
+        self.assertEqual([path.name for path in self.temp_dir.iterdir()], ["movie.mkv"])
+
+    def test_missing_parakeet_explains_one_time_setup(self) -> None:
+        with patch.object(
+            substation, "resolve_binary", side_effect=substation.EngineError("not found")
+        ):
+            with self.assertRaisesRegex(substation.EngineError, "parakeet-mlx>=0.4.1"):
+                substation.check_parakeet_dependencies()
+
     def test_dedicated_whisper_binary_wins_over_inherited_path(self) -> None:
         dedicated = self.temp_dir / "mlx_whisper"
         dedicated.write_text("executable", encoding="utf-8")
@@ -469,6 +519,52 @@ class GuiWorkflowTests(TemporaryDirectoryTest):
         result = next(payload for event, payload in events if event == "done")
         self.assertEqual(result["output"], spanish)
         self.assertIn(str(spanish), result["message"])
+
+    def test_generate_worker_passes_selected_engine(self) -> None:
+        movie = self.temp_dir / "movie.mp4"
+        english = self.temp_dir / "movie.srt"
+        movie.write_bytes(b"movie")
+        english.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+        fake_app = types.SimpleNamespace(
+            _events=queue.Queue(),
+            _queue_log=lambda _line: None,
+        )
+
+        with patch.object(
+            substation_gui, "transcribe", return_value=english
+        ) as transcribe_mock, patch.object(
+            substation_gui, "clean_srt", return_value=(1, 0)
+        ), patch.object(substation_gui, "find_repetition_warnings", return_value=[]):
+            substation_gui.SubStation._generate_worker(
+                fake_app, movie, "en", "en", False, threading.Event(), "parakeet"
+            )
+
+        self.assertEqual(transcribe_mock.call_args.args, (movie, "en", "parakeet"))
+        events = []
+        while not fake_app._events.empty():
+            events.append(fake_app._events.get())
+        self.assertIn(("stage", "Transcribing audio with Parakeet…"), events)
+        result = next(payload for event, payload in events if event == "done")
+        self.assertEqual(result["state"], "success")
+
+    def test_unready_parakeet_blocks_job_and_shows_setup(self) -> None:
+        begin_job = Mock()
+        fake_app = types.SimpleNamespace(
+            _valid_movie=lambda: self.temp_dir / "movie.mp4",
+            _selected_mode=lambda: ("en", "en"),
+            _selected_engine=lambda: "parakeet",
+            _translator_ready=False,
+            _tools_ready=True,
+            _parakeet_ready=False,
+            _parakeet_detail="Parakeet is not installed. Set it up once.",
+            _begin_job=begin_job,
+        )
+
+        with patch.object(substation_gui.messagebox, "showerror") as error:
+            substation_gui.SubStation._start_generate(fake_app)
+
+        self.assertIn("Set it up once", error.call_args.args[1])
+        begin_job.assert_not_called()
 
     def test_clean_gui_reports_each_removed_category(self) -> None:
         source = self.temp_dir / "source.srt"

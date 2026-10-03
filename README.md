@@ -8,8 +8,19 @@ re-encoding the source video or audio.
 ![sub-station desktop app: Generate tab with movie picker, subtitle mode selector and activity area](assets/substation-app.png)
 
 Using the movie audio avoids the edition and release mismatches common in
-downloaded subtitles. Whisper still estimates timestamps, so occasional dialogue
-or end-credit cues can need manual correction.
+downloaded subtitles. The speech recognizer still estimates timestamps, so occasional
+dialogue or end-credit cues can need manual correction.
+
+## Speech engines
+
+- **Whisper** (`mlx-community/whisper-large-v3-turbo`, default) uses the selected audio
+  language and the anti-repetition settings tuned for long movies.
+- **Parakeet** (NVIDIA `parakeet-tdt-0.6b-v3` through
+  [`parakeet-mlx`](https://github.com/senstella/parakeet-mlx), optional) recognizes 25
+  European languages, including English and Spanish, and detects the spoken language
+  itself. The selected mode still decides translation and the subtitle track language.
+  Cues are capped at 14 words and about 6 seconds and also end at pauses of 1.5 seconds
+  or more, because Parakeet otherwise ends a cue only at sentence punctuation.
 
 ## Language support
 
@@ -20,8 +31,8 @@ The desktop app exposes three explicit modes:
 - English audio → English `.srt` plus Spanish `*-es.srt`
   (`--language en --translate-es`).
 
-The third mode transcribes with Whisper first, then translates each cue locally with
-`Helsinki-NLP/opus-mt-en-es`. It preserves the English SRT and its timestamps. Long
+The third mode transcribes with the selected engine first, then translates each cue
+locally with `Helsinki-NLP/opus-mt-en-es`. It preserves the English SRT and its timestamps. Long
 multi-sentence cues are translated sentence by sentence so text is not silently truncated.
 A conservative terminology pass favors neutral Latin American forms such as `computador`,
 `celular`, `auto`, `jugo` and `papa`. Ambiguous words such as `móvil` and `coche` are changed
@@ -32,12 +43,12 @@ overlapping dialogue and errors already present in the English transcript need r
 ## Pipeline
 
 ```text
-movie → mlx_whisper → validated English SRT → optional local Spanish translation
-                                  └──────────→ optional ffmpeg embed → new *-subbed.mp4
+movie → mlx_whisper or parakeet-mlx → validated SRT → optional local Spanish translation
+                                             └──────────→ optional ffmpeg embed → new *-subbed.mp4
 ```
 
-- Processing stays local after the Whisper and translation models have each been
-  downloaded once. Movie audio and subtitle text are not sent to an API.
+- Processing stays local after the Whisper, Parakeet and translation models have each
+  been downloaded once. Movie audio and subtitle text are not sent to an API.
 - Generated and cleaned files use same-folder temporary outputs and exclusive atomic
   publication. A file that appears at the destination during a job is never overwritten.
 - The source movie and downloaded SRT are never overwritten.
@@ -52,7 +63,9 @@ Build the app (see **Build the macOS app** below), then open
 `dist/sub-station.app`, choose a movie, select the subtitle mode, and click
 **Generate subtitles**. The app provides:
 
-- readiness for `mlx_whisper`, `ffmpeg` and the optional local Spanish translator;
+- readiness for `mlx_whisper`, `ffmpeg`, the optional local Spanish translator and the
+  optional Parakeet engine;
+- a speech engine selector (Whisper or Parakeet);
 - stage-specific status and an in-app activity log;
 - safe cancellation;
 - **Start New Job**, which resets the form without deleting completed files;
@@ -65,7 +78,8 @@ Build the app (see **Build the macOS app** below), then open
 
 The first transcription can download the Whisper model (~1.6 GB). The Spanish model
 is prepared separately once (~894 MB). The packaged app includes Python
-and Tk, but uses the dedicated Whisper environment and `ffmpeg` installation.
+and Tk, but uses the dedicated Whisper environment, the optional Parakeet environment
+and the `ffmpeg` installation.
 
 ## Command line
 
@@ -78,6 +92,9 @@ python3 substation.py "Pelicula.mkv" --language es
 
 # English audio → English SRT + Spanish *-es.srt + Spanish subtitle track
 python3 substation.py "Movie.mkv" --translate-es --embed
+
+# English audio → English SRT + Spanish *-es.srt, transcribed with Parakeet
+python3 substation.py "Movie.mkv" --engine parakeet --translate-es
 ```
 
 ## Requirements
@@ -87,6 +104,7 @@ python3 substation.py "Movie.mkv" --translate-es --embed
 - `mlx_whisper` installed in `~/miniconda3/envs/whisper`.
 - `transformers<5`, `sentencepiece` and `sacremoses` installed in that same
   environment for English-to-Spanish translation.
+- Optional: `parakeet-mlx>=0.4.1` in its own `~/miniconda3/envs/parakeet` environment.
 - Python 3.12 with Tk for development; recent Homebrew Python 3.14 builds do not
   include `_tkinter`.
 
@@ -103,6 +121,18 @@ One-time Spanish translator setup:
 ~/miniconda3/envs/whisper/bin/python -m pip install 'transformers<5' sentencepiece sacremoses
 ~/miniconda3/envs/whisper/bin/python translation_worker.py --download
 ```
+
+One-time Parakeet setup (optional). A separate environment means installing Parakeet's
+`numpy>=2.2` and `librosa` requirements cannot change the working Whisper and translator
+setup:
+
+```bash
+conda create -n parakeet python=3.12
+~/miniconda3/envs/parakeet/bin/python -m pip install 'parakeet-mlx>=0.4.1'
+```
+
+The first Parakeet transcription downloads the model from Hugging Face; later runs
+reuse the local copy.
 
 The translator is the Apache-2.0 licensed
 [`Helsinki-NLP/opus-mt-en-es`](https://huggingface.co/Helsinki-NLP/opus-mt-en-es)
@@ -137,6 +167,8 @@ ID signing and notarization.
 
 - Whisper subtitles recognized speech and may also capture sung lyrics. It does not add
   sound-effect cues or speaker labels.
+- Parakeet detects the spoken language itself and has no option to force one, so review
+  the output of movies that mix languages.
 - Impossible cues shorter than 80 ms are removed. Repeated short phrases are reported but
   not deleted automatically, because the same pattern can be real dialogue, chants or lyrics.
 - A repeated phrase can still remain over music-only end credits; inspect reported warnings.
@@ -149,7 +181,9 @@ ID signing and notarization.
 ## License
 
 [MIT](LICENSE) — the code is free to use. The **sanblueᵈᵒᵗ** name, wordmark and brand
-identity are not covered by the license.
+identity are not covered by the license. The optional Parakeet model,
+[`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), is
+NVIDIA's work licensed under CC-BY-4.0; it is downloaded separately, not bundled.
 
 ---
 © 2026 Sandy E. Quintero — sanblueᵈᵒᵗ · retro dev-station

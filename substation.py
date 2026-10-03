@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """sub-station — local subtitle engine and command-line interface.
 
-The engine transcribes English or Spanish audio with mlx_whisper, can translate
-English cues to Spanish locally, validates the generated SubRip files, and can
-optionally add subtitles to a new MP4 without re-encoding video or audio.
+The engine transcribes English or Spanish audio with mlx_whisper or NVIDIA
+Parakeet (parakeet-mlx), can translate English cues to Spanish locally, validates
+the generated SubRip files, and can optionally add subtitles to a new MP4 without
+re-encoding video or audio.
 """
 
 from __future__ import annotations
@@ -24,12 +25,14 @@ from pathlib import Path
 from typing import Callable
 
 VERSION = "2.3.1"
-MODEL = "mlx-community/whisper-large-v3-turbo"
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 MIN_CUE_SECONDS = 0.08
 LANGUAGES = {
     "en": {"label": "English", "metadata": "eng"},
     "es": {"label": "Spanish", "metadata": "spa"},
 }
+ENGINES = {"whisper": "Whisper", "parakeet": "Parakeet"}
 
 # These flags prevent Whisper from feeding a failed window back into the next
 # window and reduce hallucinated cues across long music or silence stretches.
@@ -38,6 +41,15 @@ WHISPER_ANTI_COLLAPSE = [
     "--condition-on-previous-text", "False",
     "--word-timestamps", "True",
     "--hallucination-silence-threshold", "2",
+]
+
+# Parakeet ends a cue only at sentence punctuation, so a long unpunctuated
+# stretch would become one oversized subtitle. These limits (parakeet-mlx 0.4.1+)
+# keep cues near two readable lines and close them when the speaker pauses.
+PARAKEET_CUE_LIMITS = [
+    "--max-words", "14",
+    "--max-duration", "6",
+    "--silence-gap", "1.5",
 ]
 
 AD_PATTERNS = [
@@ -73,6 +85,9 @@ _search_dirs_cache: list[str] | None = None
 
 DEDICATED_BINARIES = {
     "mlx_whisper": Path.home() / "miniconda3" / "envs" / "whisper" / "bin" / "mlx_whisper",
+    # A separate environment keeps parakeet-mlx's numpy>=2.2 and librosa
+    # requirements from changing the working Whisper and translator setup.
+    "parakeet-mlx": Path.home() / "miniconda3" / "envs" / "parakeet" / "bin" / "parakeet-mlx",
 }
 TRANSLATION_PYTHON = Path.home() / "miniconda3" / "envs" / "whisper" / "bin" / "python"
 
@@ -125,6 +140,18 @@ def resolve_binary(name: str) -> str:
 def check_dependencies() -> dict[str, str]:
     """Resolve every external tool required by the app."""
     return {name: resolve_binary(name) for name in ("mlx_whisper", "ffmpeg")}
+
+
+def check_parakeet_dependencies() -> str:
+    """Resolve the optional Parakeet transcriber or explain its one-time setup."""
+    try:
+        return resolve_binary("parakeet-mlx")
+    except EngineError:
+        raise EngineError(
+            "Parakeet is not installed. Set it up once:\n"
+            "  conda create -n parakeet python=3.12\n"
+            "  ~/miniconda3/envs/parakeet/bin/python -m pip install 'parakeet-mlx>=0.4.1'"
+        ) from None
 
 
 def _translation_worker_path() -> Path:
@@ -461,9 +488,41 @@ def find_repetition_warnings(srt_path: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 # Pipeline steps
 # ---------------------------------------------------------------------------
+def _transcriber_command(
+    movie: Path,
+    language: str,
+    engine: str,
+    temp_dir: Path,
+) -> tuple[list[str], str]:
+    """Build the speech-recognition command and its user-facing step name."""
+    if engine == "parakeet":
+        # Parakeet v3 detects the spoken language itself and has no language flag.
+        # Format, template and model are explicit so PARAKEET_* environment
+        # variables cannot change the file name this step expects.
+        return [
+            resolve_binary("parakeet-mlx"), str(movie),
+            "--model", PARAKEET_MODEL,
+            *PARAKEET_CUE_LIMITS,
+            "--output-format", "srt",
+            "--output-dir", str(temp_dir),
+            "--output-template", "{filename}",
+            "--verbose",
+        ], "Transcribing audio with Parakeet (language detected automatically)"
+    return [
+        resolve_binary("mlx_whisper"), str(movie),
+        "--model", WHISPER_MODEL,
+        "--language", language,
+        *WHISPER_ANTI_COLLAPSE,
+        "--output-format", "srt",
+        "--output-dir", str(temp_dir),
+        "--output-name", movie.stem,
+    ], f"Transcribing {LANGUAGES[language]['label']} audio with Whisper"
+
+
 def transcribe(
     movie: Path,
     language: str = "en",
+    engine: str = "whisper",
     *,
     on_log: LogCallback | None = None,
     cancel_event: threading.Event | None = None,
@@ -471,6 +530,8 @@ def transcribe(
     """Transcribe a movie to a new SRT using an atomic final-output handoff."""
     if language not in LANGUAGES:
         raise EngineError(f"unsupported audio language: {language}")
+    if engine not in ENGINES:
+        raise EngineError(f"unsupported speech engine: {engine}")
     srt = movie.with_suffix(".srt")
     if srt.exists():
         raise EngineError(f"{srt.name} already exists, not overwriting. Rename it first.")
@@ -481,22 +542,15 @@ def transcribe(
         raise EngineError(f"could not prepare an output beside {movie.name}: {error}")
     temp_srt = temp_dir / f"{movie.stem}.srt"
     try:
-        run(
-            [
-                resolve_binary("mlx_whisper"), str(movie),
-                "--model", MODEL,
-                "--language", language,
-                *WHISPER_ANTI_COLLAPSE,
-                "--output-format", "srt",
-                "--output-dir", str(temp_dir),
-                "--output-name", movie.stem,
-            ],
-            step=f"Transcribing {LANGUAGES[language]['label']} audio",
-            on_log=on_log,
-            cancel_event=cancel_event,
-        )
+        command, step = _transcriber_command(movie, language, engine, temp_dir)
+        run(command, step=step, on_log=on_log, cancel_event=cancel_event)
+        # parakeet-mlx reports a failed file and still exits 0, so the missing
+        # output is the only failure signal for that engine.
         if not temp_srt.is_file():
-            raise EngineError(f"expected subtitle file was not created: {temp_srt.name}")
+            raise EngineError(
+                f"expected subtitle file was not created: {temp_srt.name}. "
+                "The transcriber output above explains why."
+            )
         if srt.exists():
             raise EngineError(f"{srt.name} appeared during processing; it was not overwritten.")
         _raise_if_cancelled(
@@ -646,7 +700,8 @@ def embed(
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate a timed English or Spanish SRT from a movie's audio."
+        description="Generate a timed English or Spanish SRT from a movie's audio "
+                    "with Whisper or Parakeet."
     )
     parser.add_argument("movie", help="video file")
     parser.add_argument(
@@ -654,6 +709,13 @@ def main() -> None:
         choices=sorted(LANGUAGES),
         default="en",
         help="spoken audio language: en (default) or es",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=sorted(ENGINES),
+        default="whisper",
+        help="speech recognizer: whisper (default) or parakeet "
+             "(NVIDIA Parakeet TDT v3; detects the spoken language itself)",
     )
     parser.add_argument(
         "--embed",
@@ -676,7 +738,7 @@ def main() -> None:
     try:
         if args.translate_es and args.language != "en":
             raise EngineError("--translate-es requires English audio (--language en)")
-        srt = transcribe(movie, args.language)
+        srt = transcribe(movie, args.language, args.engine)
         kept, dropped = clean_srt(srt)
         if kept == 0:
             raise EngineError(
@@ -686,7 +748,7 @@ def main() -> None:
         print(f"OK: {srt} ({kept} subtitles, {dropped} invalid cues removed)")
         repetitions = find_repetition_warnings(srt)
         if repetitions:
-            print("REVIEW: possible repeated Whisper artifacts: " + ", ".join(repetitions))
+            print("REVIEW: possible repeated transcription artifacts: " + ", ".join(repetitions))
         subtitle_language = args.language
         if args.translate_es:
             srt = translate_srt(srt)
